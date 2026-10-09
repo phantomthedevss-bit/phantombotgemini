@@ -1,0 +1,23 @@
+# Optional: "Blueprint" for one-click setup on Render (New + > Blueprint).
+# You can also ignore this file and create the Web Service manually (see README).
+services:
+  - type: web
+    name: phantom-ai-render
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: GEMINI_FALLBACK_MODEL
+        value: gemini-3.5-flash-lite

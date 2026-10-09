@@ -1,0 +1,20 @@
+{
+  "name": "phantom-ai-bot",
+  "version": "1.0.0",
+  "description": "PHANTOM AI - Telegram bot powered by Google Gemini. Runs on Render and Vercel.",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --env-file=.env server.js"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "express": "^4.21.2",
+    "grammy": "^1.30.0"
+  }
+}

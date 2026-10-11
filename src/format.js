@@ -48,18 +48,24 @@ export function splitText(text, max = 3500) {
   return chunks.length ? chunks : [text];
 }
 
-/** Reply with formatting; if Telegram rejects the HTML, fall back to plain text. */
-export async function replyLong(ctx, text, extra = {}) {
-  for (const chunk of splitText(text)) {
+/** Send chunks through any "send" function; the last chunk also gets `lastExtra` (e.g. buttons). */
+async function sendChunks(send, text, extra, lastExtra) {
+  const chunks = splitText(text);
+  for (let i = 0; i < chunks.length; i++) {
+    const opts = { ...extra, ...(i === chunks.length - 1 ? lastExtra : {}) };
     try {
-      await ctx.reply(mdToHtml(chunk), {
-        parse_mode: "HTML",
-        link_preview_options: { is_disabled: true },
-        ...extra,
-      });
+      await send(mdToHtml(chunks[i]), { parse_mode: "HTML", link_preview_options: { is_disabled: true }, ...opts });
     } catch (err) {
       console.error("[format] HTML rejected, sending plain text:", err?.description ?? err?.message);
-      await ctx.reply(chunk, extra);
+      await send(chunks[i], opts);
     }
   }
 }
+
+/** Reply to the current message with formatting; falls back to plain text if Telegram rejects the HTML. */
+export const replyLong = (ctx, text, extra = {}, lastExtra = {}) =>
+  sendChunks((t, o) => ctx.reply(t, o), text, extra, lastExtra);
+
+/** Send to a chat id without a ctx (used by reminders and the daily briefing). */
+export const sendLongTo = (api, chatId, text, extra = {}, lastExtra = {}) =>
+  sendChunks((t, o) => api.sendMessage(chatId, t, o), text, extra, lastExtra);

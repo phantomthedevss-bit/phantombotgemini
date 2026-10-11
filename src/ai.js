@@ -1,10 +1,12 @@
-// src/ai.js — everything that talks to Google Gemini
+// src/ai.js — everything that talks to Google Gemini (chat, memory, personas, function calling)
 import { GoogleGenAI } from "@google/genai";
+import { toolDeclarations, runTool } from "./tools.js";
+import { nowLocalIso } from "./timeutil.js";
 
 const getModel = () => process.env.GEMINI_MODEL || "gemini-3.5-flash";
 const getFallbackModel = () => process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite";
 const MAX_TURNS = Number(process.env.MAX_HISTORY_TURNS || 12);
-const MAX_SESSIONS = 500;
+const MAX_TOOL_STEPS = 5;
 
 let client;
 function getClient() {
@@ -17,7 +19,7 @@ function getClient() {
 
 /* ------------------------------ Personalities ------------------------------ */
 
-const BASE_PROMPT = `You are PHANTOM AI, a sharp, friendly assistant living inside Telegram.
+export const BASE_PROMPT = `You are PHANTOM AI, a sharp, friendly assistant living inside Telegram.
 - Reply in the same language the user writes in.
 - Be direct and useful. No filler, no repeating the question.
 - Formatting: you may use **bold**, *italic*, \`inline code\`, fenced code blocks and simple "-" bullet lists.
@@ -25,10 +27,7 @@ const BASE_PROMPT = `You are PHANTOM AI, a sharp, friendly assistant living insi
 - If you are unsure or don't know something, say so instead of guessing.`;
 
 export const MODES = {
-  assistant: {
-    label: "General assistant",
-    prompt: BASE_PROMPT,
-  },
+  assistant: { label: "General assistant", prompt: BASE_PROMPT },
   coder: {
     label: "Coding expert",
     prompt: `${BASE_PROMPT}
@@ -48,54 +47,61 @@ Answer in the fewest words possible: 1-3 short sentences unless the user explici
   },
 };
 
-/* --------------------------------- Sessions -------------------------------- */
-// NOTE: kept in memory. On Vercel (serverless) and on Render's free tier the memory is
-// wiped when the instance goes to sleep / restarts. That's fine for casual chatting.
-const sessions = new Map();
+/** The active persona for a profile: a built-in mode or one the user created. */
+export function resolvePersona(profile) {
+  const custom = profile.personas?.[profile.mode];
+  if (custom) return { key: profile.mode, label: `Custom: ${profile.mode}`, prompt: `${BASE_PROMPT}\n${custom}` };
+  const builtin = MODES[profile.mode] ?? MODES.assistant;
+  return { key: MODES[profile.mode] ? profile.mode : "assistant", label: builtin.label, prompt: builtin.prompt };
+}
 
-function session(chatId) {
-  let s = sessions.get(chatId);
-  if (!s) {
-    s = { mode: "assistant", history: [] };
-    sessions.set(chatId, s);
-    if (sessions.size > MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
+function buildSystem(profile, withTools) {
+  const persona = resolvePersona(profile);
+  const lines = [persona.prompt, ""];
+
+  if (profile.name) lines.push(`The user's name is ${profile.name}.`);
+  if (profile.facts?.length) {
+    lines.push(
+      "Things you know about the user (use them naturally when relevant; don't recite them unprompted):",
+      ...profile.facts.map((f) => `- ${f}`),
+    );
   }
-  return s;
+  lines.push(
+    `User's time zone: ${profile.tz}${profile.tzSet ? "" : " (not set yet, UTC assumed)"}.`,
+    `User's current local time: ${nowLocalIso(profile.tz)} (UTC now: ${new Date().toISOString().slice(0, 16)}).`,
+  );
+
+  if (withTools) {
+    lines.push(
+      "",
+      "You can call tools. Rules:",
+      "- Use tools for live data (weather, news, prices, exchange rates, web pages) instead of guessing.",
+      "- Use the calculator tool for any non-trivial arithmetic.",
+      "- If the user shares an important lasting detail about themselves or asks you to remember something, call save_fact.",
+      "- For reminders call set_reminder. Use in_minutes for relative times; for clock times compute datetime_local from the user's current local time above.",
+      "- For repeating reminders ('every day at 8', 'every Monday') also set repeat, with datetime_local = the first occurrence.",
+      "- Tasks without a specific time go on the to-do list: add_todo, list_todos, complete_todo, delete_todo.",
+      "- If the user says where they live and their time zone isn't set, call set_timezone.",
+      "- Never claim you set a reminder, saved a fact or changed a setting unless the tool result confirms it. If a tool returns an error, explain it simply.",
+      "- When you used a tool, answer in natural language; don't dump raw JSON.",
+    );
+  }
+  return lines.join("\n");
 }
 
-export const getMode = (chatId) => session(chatId).mode;
+/* ------------------------------- Gemini calls ------------------------------ */
 
-export function setMode(chatId, mode) {
-  if (!MODES[mode]) return false;
-  session(chatId).mode = mode;
-  return true;
+function modelList() {
+  return [getModel(), getFallbackModel()].filter((m, i, arr) => m && arr.indexOf(m) === i);
 }
 
-export function resetSession(chatId) {
-  session(chatId).history = [];
-}
-
-/* ------------------------------- Generation -------------------------------- */
-
-function withDate(prompt) {
-  return `${prompt}\n\nCurrent date/time (UTC): ${new Date().toUTCString()}`;
-}
-
-async function generate({ contents, system }) {
+async function callModel(models, contents, config) {
   const ai = getClient();
-  const models = [getModel(), getFallbackModel()].filter((m, i, arr) => m && arr.indexOf(m) === i);
   let lastError;
-
   for (const model of models) {
     try {
-      const res = await ai.models.generateContent({
-        model,
-        contents,
-        config: { systemInstruction: withDate(system) },
-      });
-      const text = (res.text || "").trim();
-      if (text) return text;
-      lastError = new Error("Empty response (the answer may have been blocked by safety filters).");
+      const res = await ai.models.generateContent({ model, contents, config });
+      return res;
     } catch (err) {
       lastError = err;
       console.error(`[gemini] ${model} failed:`, err?.status ?? "", err?.message ?? err);
@@ -104,32 +110,83 @@ async function generate({ contents, system }) {
   throw lastError;
 }
 
+/** Generate text, letting Gemini call tools in a loop until it has a final answer. */
+async function generate({ contents, system, env }) {
+  const decls = env ? toolDeclarations() : [];
+  const models = modelList();
+  const convo = [...contents];
+
+  for (let step = 0; step <= MAX_TOOL_STEPS; step++) {
+    const lastStep = step === MAX_TOOL_STEPS; // force a text answer on the final round
+    const config = { systemInstruction: system };
+    if (decls.length && !lastStep) config.tools = [{ functionDeclarations: decls }];
+
+    const res = await callModel(models, convo, config);
+    const calls = res.functionCalls;
+
+    if (!calls?.length) {
+      const text = (res.text || "").trim();
+      if (text) return text;
+      throw new Error("Empty response (the answer may have been blocked by safety filters).");
+    }
+
+    // Keep Gemini's own turn untouched (it carries thought signatures), then answer every call.
+    convo.push(res.candidates[0].content);
+    const responses = [];
+    for (const call of calls) {
+      const result = await runTool(call.name, call.args, env);
+      responses.push({ functionResponse: { name: call.name, response: { result } } });
+    }
+    convo.push({ role: "user", parts: responses });
+  }
+  throw new Error("Too many tool steps.");
+}
+
 const partsToText = (parts) => parts.map((p) => p.text).filter(Boolean).join("\n");
+const toContents = (history) => history.map((h) => ({ role: h.role, parts: [{ text: h.text }] }));
 
 /**
- * Chat with memory.
- * @param {string|number} chatId
- * @param {Array} parts      Gemini parts for this user turn (text and/or inlineData)
- * @param {string} [historyNote]  What to store in memory instead of raw media (keeps memory small)
+ * Chat with saved memory, personas, facts and tools.
+ * @param {object} a
+ * @param {object} a.store       persistence (see store.js)
+ * @param {string|number} a.userId
+ * @param {string|number} a.chatId
+ * @param {Array} a.parts        Gemini parts for this user turn (text and/or inlineData)
+ * @param {string} [a.historyNote]  What to store in memory instead of raw media
+ * @param {string} [a.name]      The user's first name (saved to their profile)
  */
-export async function chat(chatId, parts, historyNote) {
-  const s = session(chatId);
-  const contents = [...s.history, { role: "user", parts }];
-  const text = await generate({ contents, system: MODES[s.mode].prompt });
+export async function chat({ store, userId, chatId, parts, historyNote, name }) {
+  const profile = await store.getProfile(userId);
+  if (name && profile.name !== name) {
+    profile.name = name;
+    await store.saveProfile(userId, profile);
+  }
 
-  s.history.push(
-    { role: "user", parts: [{ text: historyNote ?? partsToText(parts) }] },
-    { role: "model", parts: [{ text }] },
-  );
-  s.history = s.history.slice(-MAX_TURNS * 2);
+  const history = await store.getHistory(chatId);
+  const contents = [...toContents(history), { role: "user", parts }];
+  const env = { store, userId, chatId, profile };
+  const text = await generate({ contents, system: buildSystem(profile, true), env });
+
+  history.push({ role: "user", text: historyNote ?? partsToText(parts) }, { role: "model", text });
+  await store.saveHistory(chatId, history.slice(-MAX_TURNS * 2));
   return text;
 }
 
-/** One-off task with no memory (translate, summarize, fix...). */
+/** Redo the last answer. Returns null if there's nothing (text-only) to redo. */
+export async function regenerate({ store, userId, chatId, name }) {
+  const history = await store.getHistory(chatId);
+  const last = history.at(-2);
+  if (!last || last.role !== "user" || last.text.startsWith("[User sent")) return null;
+  await store.saveHistory(chatId, history.slice(0, -2));
+  return chat({ store, userId, chatId, parts: [{ text: last.text }], name });
+}
+
+/** One-off task with no memory and no tools (translate, summarize, fix, briefing...). */
 export async function oneShot(instruction, userText) {
   return generate({
     contents: [{ role: "user", parts: [{ text: userText }] }],
-    system: instruction,
+    system: `${instruction}\n\nCurrent date/time (UTC): ${new Date().toUTCString()}`,
+    env: null,
   });
 }
 
@@ -147,5 +204,6 @@ export function friendlyError(err) {
   if (status === 404) return "🤖 The configured Gemini model wasn't found. Check GEMINI_MODEL.";
   if (/safety|blocked|Empty response/i.test(msg)) return "🚫 Gemini didn't return an answer for that (possibly blocked by safety filters).";
   if (/GEMINI_API_KEY is not set/.test(msg)) return "⚙️ GEMINI_API_KEY is missing on the server.";
+  if (/UPSTASH|Redis|fetch failed.*upstash/i.test(msg)) return "💾 I couldn't reach my database. Check the Upstash credentials.";
   return "⚠️ Something went wrong while talking to Gemini. Please try again.";
 }

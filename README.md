@@ -1,203 +1,231 @@
-# 👻 PHANTOM AI — Telegram bot powered by Gemini
+# 👻 PHANTOM AI v2.1 — Telegram assistant powered by Gemini
 
-One codebase, deployed **twice**: one bot on **Render**, one bot on **Vercel**. Both are free.
+One codebase, deployable on **Vercel** and/or **Render**. Free.
 
 ## What it does
 
-- 💬 Chats with memory (powered by Google Gemini)
-- 🖼 Understands photos · 🎤 voice messages · 📄 PDFs and .txt files
-- 🎭 `/mode` — assistant, coder, teacher, concise
-- 🌍 `/translate`, 📝 `/summarize`, ✏️ `/fix`, 🕒 `/time`, 🪪 `/id`, 🧹 `/reset`
-- 🔒 Optional allow-list so only you can use it (protects your free Gemini quota)
-- 👥 Works in groups (reply to it or @mention it)
+**Talk to it**
+- 💬 Chat with memory that **survives restarts** (needs the free database)
+- 🖼 Photos · 🎤 voice notes · 📄 PDFs and .txt files · 🔗 links (it reads the page)
+- 🎭 Personalities: assistant, coder, teacher, concise, **plus your own** (`/persona`)
+
+**It can DO things** (function calling: just ask in plain words)
+- 🌦 Weather: "weather in Paris?"
+- 📰 News: "latest news about football"
+- 💱 Prices and rates: "price of bitcoin", "convert 200 USD to NGN"
+- 📚 Wikipedia lookups · 🧮 exact calculator · 🕒 time in any city
+- ⏰ **Reminders**: "remind me tomorrow at 9am to call mum", or repeating: "every weekday at 8am take my vitamins"
+- ✅ **To-do list**: "add milk to my to-do list" (tick items off with buttons)
+- 🧠 **Saved facts**: "remember that I'm vegetarian" (it uses them in later chats)
+- 🌅 **Daily briefing**: weather + news + your reminders, sent every morning
+- 🌐 Optional live web search (add a free Tavily key)
+
+**Buttons**
+- `/menu` opens a button menu
+- Under every answer: 🔄 Regenerate · ✂️ Shorter · 🧹 New chat
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/menu` | Button menu |
+| `/mode` | Pick a personality (buttons) |
+| `/persona add name \| instructions` | Create your own personality |
+| `/persona delete name` | Delete it |
+| `/remember <fact>` · `/facts` · `/forget <n\|all>` | What I know about you |
+| `/remind <when and what>` · `/reminders` | Reminders, one-off or repeating (list/cancel with buttons) |
+| `/todo` · `/todo buy milk` · `/todo done 2` · `/todo del 2` · `/todo clear` | To-do list (also tick items with buttons) |
+| `/briefing` | Daily briefing settings |
+| `/briefing time 07:30` · `city Paris` · `topics tech, football` · `on` · `off` · `now` | Configure it |
+| `/timezone Continent/City` | **Set this first**, so reminders and the briefing use your clock |
+| `/translate` · `/summarize` · `/fix` | One-off helpers (also work on a replied message) |
+| `/reset` | Fresh chat (saved facts are kept) |
+| `/me` | Your settings, and whether the database is connected |
+| `/id` | Your Telegram user ID |
 
 ## Project layout
 
 ```
 phantom-ai-bot/
 ├── src/
-│   ├── bot.js          # commands + message handling (shared)
-│   ├── ai.js           # Gemini calls, memory, personalities (shared)
-│   └── format.js       # markdown -> Telegram HTML, long-message splitting
-├── server.js           # RENDER entry point (Express web service)
+│   ├── bot.js        # commands, menus, buttons (shared)
+│   ├── ai.js         # Gemini chat + function-calling loop + personas (shared)
+│   ├── tools.js      # everything Gemini can DO: weather, news, reminders... (shared)
+│   ├── store.js      # database layer (Upstash Redis, RAM fallback)
+│   ├── scheduler.js  # sends due reminders + daily briefings
+│   ├── timeutil.js   # time-zone maths
+│   └── format.js     # markdown -> Telegram HTML, message splitting
+├── server.js         # RENDER entry point
 ├── api/
-│   ├── webhook.js      # VERCEL entry point (serverless function)
-│   └── set-webhook.js  # VERCEL one-time setup endpoint
-├── public/index.html   # simple landing page for Vercel
-├── vercel.json
-├── render.yaml         # optional Render blueprint
-├── package.json
-└── .env.example
+│   ├── webhook.js    # VERCEL entry point
+│   ├── set-webhook.js# VERCEL one-time setup endpoint
+│   └── cron.js       # VERCEL "every minute" endpoint (reminders + briefing)
+├── public/index.html
+├── vercel.json · render.yaml · package.json · .env.example
 ```
 
 ---
 
-## Step 0 — Get your keys (5 minutes)
+## Environment variables
 
-**Two Telegram bots.** A Telegram bot token can only point to ONE webhook, so you need two bots:
-
-1. Open Telegram → chat with **@BotFather**
-2. Send `/newbot` → name it e.g. `PHANTOM AI Vercel` → username e.g. `phantom_vercel_bot` → copy the token
-3. Send `/newbot` again → `PHANTOM AI Render` → `phantom_render_bot` → copy the second token
-
-**Gemini API key:** you already have it (https://aistudio.google.com/apikey). The same key can be used for both bots (they share one free quota).
-
-**Webhook secret:** any long random string. Generate one:
-
-```bash
-node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
-```
-
-(No Node installed? Just mash out 30+ random letters and numbers. Only `A-Z a-z 0-9 _ -` are allowed.)
-
-Use the **same** `WEBHOOK_SECRET` for both deployments, or different ones. Either works.
+| Name | Required | What to put |
+|---|---|---|
+| `BOT_TOKEN` | ✅ | Token from @BotFather (a **different** bot per platform) |
+| `GEMINI_API_KEY` | ✅ | From aistudio.google.com/apikey |
+| `WEBHOOK_SECRET` | ✅ | Any long random text you make up (letters/numbers/`_`/`-`) |
+| `UPSTASH_REDIS_REST_URL` | for memory, reminders, briefing, facts | From Upstash (see below) |
+| `UPSTASH_REDIS_REST_TOKEN` | same | From Upstash |
+| `ALLOWED_USER_IDS` | recommended | Your Telegram ID from `/id` (comma-separate several) |
+| `NEWS_COUNTRY` | optional | 2-letter country for headlines, e.g. `NG`, `GB`, `US`, `KE`. Default `US` |
+| `TAVILY_API_KEY` | optional | Enables live web search (free key at tavily.com; check their current free limits) |
+| `CRON_SECRET` | optional | Separate password for the cron URL. Defaults to `WEBHOOK_SECRET` |
+| `DAILY_MESSAGE_LIMIT` | optional | Max AI messages per user per day, e.g. `50`. Empty = unlimited. Protects your Gemini quota |
+| `GEMINI_MODEL` / `GEMINI_FALLBACK_MODEL` | optional | Defaults `gemini-3.5-flash` / `gemini-3.5-flash-lite` |
 
 ---
 
-## Step 1 — Put the code on GitHub
+## Add the database (needed for reminders, briefing, saved facts, permanent memory)
 
-Both Render and Vercel deploy from a Git repo.
+Without it the bot still works, but memory resets on restarts and `/remind` and `/briefing` say they need the database.
 
-```bash
-cd phantom-ai-bot
-git init
-git add .
-git commit -m "PHANTOM AI bot"
-```
+**Option A: Upstash directly (works for Vercel AND Render)**
+1. Sign up at https://upstash.com (free plan, no card).
+2. **Create Database** → type **Redis** → pick the region closest to you → plan **Free**.
+3. Open the database and scroll to the **REST API** section (or the `.env` tab).
+4. Copy `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+5. Add both as environment variables on Vercel (and Render if you use it).
 
-Create an empty repo on https://github.com/new (private is fine), then:
+**Option B: from Vercel's Storage tab**
+Project → **Storage** → add **Upstash Redis** and connect it to the project. Vercel adds `KV_REST_API_URL` and `KV_REST_API_TOKEN` automatically. The bot accepts these names too.
 
-```bash
-git remote add origin https://github.com/YOUR_USERNAME/phantom-ai-bot.git
-git branch -M main
-git push -u origin main
-```
-
-`.env` is in `.gitignore`, so your secrets never get uploaded.
+The free plan lists 500K commands per month and about 250 MB (check upstash.com/pricing/redis for current numbers). An idle minute timer costs 1 command per tick, about 43,000 a month, and each chat message uses roughly 3 to 4, so one person stays far below the limit.
 
 ---
 
-## Step 2A — Deploy on Vercel
+## Set up the minute timer (needed for reminders + daily briefing)
 
-1. Go to https://vercel.com → **Sign up with GitHub**.
-2. **Add New… → Project** → **Import** your `phantom-ai-bot` repo.
-3. Configure the project:
-   - **Framework Preset:** `Other`
-   - Leave Build Command, Output Directory and Install Command **empty / default**.
-4. Open **Environment Variables** and add:
+Vercel's free plan can't run a job every minute, so a free outside timer pokes the bot.
 
-   | Name | Value |
-   |---|---|
-   | `BOT_TOKEN` | the **Vercel bot's** token from BotFather |
-   | `GEMINI_API_KEY` | your Gemini key |
-   | `WEBHOOK_SECRET` | your random string |
-   | `ALLOWED_USER_IDS` | *(optional, add later — see Step 3)* |
+**On Vercel**
+1. Sign up free at https://cron-job.org
+2. **Create cronjob**
+   - **URL:** `https://YOUR-PROJECT.vercel.app/api/cron?key=YOUR_WEBHOOK_SECRET`
+   - **Schedule:** every **1 minute**
+3. Save. Open the same URL in your browser once: you should see `{"ok":true,"processed":0,"database":true}`.
+   If `database` says `false`, the Upstash variables are missing or you haven't redeployed since adding them.
 
-5. Click **Deploy**. Wait for the green "Congratulations" screen.
-6. Register the webhook (one time). Open this URL in your browser, using your project's domain and your secret:
+cron-job.org is free and allows a 1-minute interval. It gives up on a call after 30 seconds, so if a briefing ever takes longer it may log a failed run, but the bot still finishes and sends it (each reminder or briefing is claimed once, so nothing is sent twice).
 
-   ```
-   https://YOUR-PROJECT.vercel.app/api/set-webhook?key=YOUR_WEBHOOK_SECRET
-   ```
+If every-minute isn't available for you, UptimeRobot (free) can ping the same URL every 5 minutes. Reminders may then arrive up to 5 minutes late.
 
-   You should see JSON with `"ok": true` and a `webhook` URL ending in `/api/webhook`.
-7. Open the Vercel bot in Telegram and send `/start`. 🎉
-
-> **Use the short production domain** (`YOUR-PROJECT.vercel.app`, shown under *Settings → Domains*), not the long per-deployment URL. The long URLs can be protected by Vercel login, which would block Telegram.
->
-> If you add or change an environment variable later, **redeploy** (Deployments → ⋯ → Redeploy), then open the `set-webhook` URL again if you changed `BOT_TOKEN` or `WEBHOOK_SECRET`.
+**On Render**
+Nothing to do. The server checks every minute by itself while it's awake. Keep it awake with an UptimeRobot monitor on `/health` (see below).
 
 ---
 
-## Step 2B — Deploy on Render
+## First deployment (from scratch)
 
-1. Go to https://render.com → **Sign up with GitHub**.
-2. **New + → Web Service** → connect your `phantom-ai-bot` repo.
-3. Fill in:
-   - **Name:** `phantom-ai-render` (anything)
-   - **Language/Runtime:** `Node`
-   - **Branch:** `main`
-   - **Build Command:** `npm install`
-   - **Start Command:** `npm start`
-   - **Instance Type:** `Free`
-4. Open **Advanced → Health Check Path** and set `/health`.
-5. Under **Environment Variables** add:
+### Step 0: Keys
+1. In Telegram, message **@BotFather** → `/newbot` → copy the token. Make a second bot if you want both platforms.
+2. Make up a `WEBHOOK_SECRET`.
+3. Create the Upstash database (above).
 
-   | Name | Value |
-   |---|---|
-   | `BOT_TOKEN` | the **Render bot's** token from BotFather (different from Vercel's) |
-   | `GEMINI_API_KEY` | your Gemini key |
-   | `WEBHOOK_SECRET` | your random string |
-   | `ALLOWED_USER_IDS` | *(optional, add later)* |
+### Step 1: GitHub
+Create a repo, upload/push the project. `.env` is git-ignored, so secrets never get uploaded.
 
-6. Click **Create Web Service**. Watch the logs; success looks like:
+### Step 2A: Vercel
+1. vercel.com → **Add New → Project** → import the repo.
+2. **Application Preset: `Other`** (not Express). Leave build settings empty.
+3. Add the environment variables from the table above, then **Deploy**.
+4. Open `https://YOUR-PROJECT.vercel.app/api/set-webhook?key=YOUR_WEBHOOK_SECRET` once. You should see `"ok": true`.
+5. Set up the minute timer (above).
 
-   ```
-   🚀 PHANTOM AI listening on port 10000
-   ✅ Webhook set: https://phantom-ai-render.onrender.com/webhook
-   ```
-
-   The webhook is registered **automatically** on every start. Nothing else to do.
-7. Message the Render bot on Telegram: `/start`. 🎉
-
-### Keep Render awake (important on the free plan)
-
-Free Render services **sleep after ~15 minutes without traffic**. The first message after a nap still arrives, but the reply can take 30–60 seconds. To avoid that:
-
-1. Create a free account at https://uptimerobot.com
-2. **Add New Monitor** → type `HTTP(s)` → URL `https://YOUR-SERVICE.onrender.com/health` → interval **5 minutes**.
-
-A single always-on free service fits inside Render's monthly free instance hours.
+### Step 2B: Render
+1. render.com → **New + → Web Service** → connect the repo.
+2. Runtime **Node**, Build `npm install`, Start `npm start`, Instance **Free**, Health Check Path `/health`.
+3. Add the environment variables, then **Create Web Service**.
+4. The logs should show `✅ Webhook set: ...` and `⏰ Reminders & daily briefing: scheduler running`.
+5. Free Render services sleep after about 15 minutes idle. Add a free UptimeRobot monitor on `https://YOUR-SERVICE.onrender.com/health` every 5 minutes.
 
 ---
 
-## Step 3 — Lock the bot to yourself (recommended)
+## 🔄 How to update an existing bot to this version
 
-Right now anyone who finds your bot can use up your Gemini quota.
+Your bot is already connected to GitHub, so updating = change the files, then let Vercel redeploy. Do it in this order so you only deploy once:
 
-1. Send `/id` to each bot → it replies with your numeric user ID.
-2. Add `ALLOWED_USER_IDS=123456789` (comma-separate several IDs) to the environment variables on **both** platforms.
-   - **Render:** Environment tab → Save → it restarts automatically.
-   - **Vercel:** Settings → Environment Variables → then **Redeploy**.
-3. Anyone else now gets "🔒 This is a private bot."
+**1. Add the new environment variables first** (Vercel → project → **Settings → Environment Variables**)
+- `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` (from the database step)
+- Optional: `NEWS_COUNTRY`, `ALLOWED_USER_IDS`, `TAVILY_API_KEY`
+
+**2. Put the new files on GitHub**
+- *No git needed:* unzip the project → open your repo on github.com → **Add file → Upload files** → drag in **everything inside the unzipped folder** (including the `src` and `api` folders) → **Commit changes**. Files with the same name get replaced.
+- *With git:* copy the new files over your project folder, then:
+  ```bash
+  git add .
+  git commit -m "PHANTOM AI v2"
+  git push
+  ```
+
+**3. Wait for Vercel.** Project → **Deployments**: the top one must say **Ready**. If you added variables after the last deploy, also click **⋯ → Redeploy** so they apply.
+
+**4. Re-register the webhook (important this time).** Open
+`https://YOUR-PROJECT.vercel.app/api/set-webhook?key=YOUR_WEBHOOK_SECRET`
+This tells Telegram to also send **button presses**, and refreshes the "/" command menu. Without it the buttons won't work.
+
+**5. Set up the minute timer** (cron-job.org section above).
+
+**6. Test it**
+1. `/me` → should say `Storage: permanent (Upstash) ✅`
+2. `/timezone Africa/Lagos` (or your own city's zone)
+3. `/menu` → tap around
+4. "Remind me in 2 minutes to test" → wait for the ⏰ message
+5. `/briefing city YourCity` → `/briefing now`, then `/briefing on` (and `/briefing time 07:30`) to get it every day
+6. "Remember that I like coffee" → `/facts`
+7. `/todo buy milk` → tap the number to tick it
+8. "Remind me every weekday at 8am to stretch" → `/reminders` shows 🔁
+
+**Later updates:** edit or upload files on GitHub → Vercel redeploys automatically in about a minute.
+Extra steps only when:
+- you **add a command or button type** → open the `set-webhook` link again;
+- you **change an environment variable** → redeploy;
+- you **change `BOT_TOKEN` or `WEBHOOK_SECRET`** → redeploy, then open the `set-webhook` link again.
+
+On Render, pushing to GitHub redeploys it and it re-registers its own webhook.
 
 ---
 
 ## Troubleshooting
 
-**Bot doesn't answer.** Ask Telegram what it sees (replace the token):
-
-```
-https://api.telegram.org/botYOUR_BOT_TOKEN/getWebhookInfo
-```
-
-Look at `url` and `last_error_message`:
+**Bot silent.** Open `https://api.telegram.org/botYOUR_BOT_TOKEN/getWebhookInfo` and read `last_error_message`:
 
 | Message | Fix |
 |---|---|
-| `url` is empty | Vercel: open the `set-webhook` link again. Render: check logs for "Webhook set". |
-| `401 Unauthorized` | `WEBHOOK_SECRET` differs from what was registered. Redeploy, then re-run set-webhook (Vercel) or restart (Render). |
-| `401` / HTML login page (Vercel) | You registered a protected deployment URL. Use the production domain. |
-| `500` | Open the platform's logs; usually a missing environment variable. |
+| `url` empty | Vercel: open the `set-webhook` link. Render: check logs for "Webhook set". |
+| `401` | `WEBHOOK_SECRET` doesn't match. Redeploy, then run `set-webhook` again. |
+| `500` | Open the platform's logs: usually a missing environment variable. |
 
-**"Rate limit" replies.** You hit the Gemini free-tier limits (shared by both bots). Wait a minute, or set `GEMINI_MODEL=gemini-3.5-flash-lite`, which is cheaper on quota.
+**Buttons do nothing.** You skipped step 4 of the update. Open the `set-webhook` link.
 
-**"Model not found."** Google retires and adds models over time. Set `GEMINI_MODEL` to a current one from https://ai.google.dev/gemini-api/docs/models
+**`/me` says "temporary, RAM only".** The Upstash variables are missing or wrong, or you haven't redeployed since adding them.
 
-**Memory resets.** Chat memory lives in RAM: it clears when Vercel starts a fresh instance or Render restarts or sleeps. For permanent memory, add a free database (Upstash Redis or Supabase).
+**Reminders or briefing never arrive.** Check, in order: `/me` shows permanent storage; `/timezone` is set; the cron-job.org job is running every minute and its URL shows `"ok":true` in your browser.
 
-**Testing locally.** `cp .env.example .env`, fill it in, `npm install`, `npm run dev`. With no public URL it uses long-polling. **Use a third bot token for local testing**: polling on a token removes that bot's webhook.
+**"Rate limit" replies.** Gemini free-tier limits are shared by all your bots. A question that uses a tool costs about 2 Gemini requests (one to pick the tool, one to answer), and a daily briefing costs 1.
+
+**Wrong time on reminders.** Send `/timezone Continent/City`. Until you do, UTC is assumed.
 
 ---
 
 ## Notes
 
-- On the Gemini **free tier**, Google may use your prompts to improve its products, so don't send private data you wouldn't want reviewed.
-- The free tier also has no Google Search grounding, so the bot can't browse the web. It knows only what the model knows, plus today's date.
+- **Privacy:** chat history and saved facts are stored in *your* Upstash database. On the Gemini free tier, Google may use prompts to improve its products, so avoid sending secrets.
+- **Link reading:** the bot refuses addresses on private networks (localhost, 10.x, 192.168.x and similar). Use `ALLOWED_USER_IDS` so only you can ask it to open links.
+- **Data sources (all free, no key):** Open-Meteo (weather), Google News RSS (headlines, an unofficial feed that may change), CoinGecko (crypto, rate-limited), Wikipedia, and exchange rates by [Exchange Rate API](https://www.exchangerate-api.com), whose free endpoint asks for this attribution.
+- **Local testing:** `cp .env.example .env`, fill it in, `npm install`, `npm run dev` (long-polling). Use a third bot token, because polling removes that bot's webhook.
 
-## Ideas to extend it
+## Ideas for next
 
-- Reminders / scheduled messages (needs a database + Vercel Cron or a Render cron job)
-- Per-user saved notes with `/note` and `/notes`
-- Image generation (paid Gemini models only)
-- Function calling: let Gemini call your own APIs (weather, crypto prices, your calendar…)
+- Group assistant: summarise a group's day
+- Voice replies (text-to-speech)
+- Inline mode (`@yourbot question` in any chat)
+- Image generation (Gemini's image models are paid only)

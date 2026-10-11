@@ -3,8 +3,10 @@
 // - On Render it runs in WEBHOOK mode and registers the webhook automatically
 //   using the RENDER_EXTERNAL_URL that Render provides.
 // - On your own computer (no public URL) it falls back to POLLING so you can test locally.
+// - Every minute it checks for due reminders and daily briefings (needs the Upstash database).
 import express from "express";
 import { createBot, processUpdate, COMMANDS, ALLOWED_UPDATES } from "./src/bot.js";
+import { runDue } from "./src/scheduler.js";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -13,6 +15,7 @@ if (!token) {
 }
 
 const secret = process.env.WEBHOOK_SECRET || undefined;
+const cronKey = process.env.CRON_SECRET || secret;
 const baseUrl = (process.env.WEBHOOK_BASE_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
 const port = Number(process.env.PORT) || 3000;
 
@@ -31,6 +34,18 @@ app.post("/webhook", (req, res) => {
   processUpdate(bot, req.body).catch((err) => console.error("❌ Update failed:", err));
 });
 
+// Optional external trigger (the built-in timer below already does this while the service is awake).
+app.get("/cron", async (req, res) => {
+  const given = req.query.key ?? req.get("authorization")?.replace(/^Bearer /i, "");
+  if (!cronKey || given !== cronKey) return res.sendStatus(401);
+  try {
+    res.json({ ok: true, processed: await runDue(bot.api, bot.store) });
+  } catch (err) {
+    console.error("❌ Cron failed:", err);
+    res.status(500).json({ ok: false });
+  }
+});
+
 app.listen(port, async () => {
   console.log(`🚀 PHANTOM AI listening on port ${port}`);
 
@@ -38,6 +53,13 @@ app.listen(port, async () => {
     await bot.api.setMyCommands(COMMANDS);
   } catch (err) {
     console.error("Could not set the command menu:", err.message);
+  }
+
+  if (bot.store.persistent) {
+    setInterval(() => runDue(bot.api, bot.store).catch((err) => console.error("❌ Scheduler:", err)), 60_000);
+    console.log("⏰ Reminders & daily briefing: scheduler running (every minute).");
+  } else {
+    console.log("ℹ️  No Upstash database configured: reminders and daily briefing are disabled.");
   }
 
   if (baseUrl) {

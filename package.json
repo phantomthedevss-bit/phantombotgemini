@@ -1,6 +1,6 @@
 {
   "name": "phantom-ai-bot",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "PHANTOM AI - Telegram bot powered by Google Gemini. Runs on Render and Vercel.",
   "private": true,
   "type": "module",

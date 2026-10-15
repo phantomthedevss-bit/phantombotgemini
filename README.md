@@ -1,4 +1,4 @@
-# 👻 PHANTOM AI v2.1 — Telegram assistant powered by Gemini
+# 👻 PHANTOM AI v2.2 — Telegram assistant powered by Gemini
 
 One codebase, deployable on **Vercel** and/or **Render**. Free.
 
@@ -7,22 +7,38 @@ One codebase, deployable on **Vercel** and/or **Render**. Free.
 **Talk to it**
 - 💬 Chat with memory that **survives restarts** (needs the free database)
 - 🖼 Photos · 🎤 voice notes · 📄 PDFs and .txt files · 🔗 links (it reads the page)
-- 🎭 Personalities: assistant, coder, teacher, concise, **plus your own** (`/persona`)
+- 🎭 Personalities: assistant, coder, teacher, concise, naija buddy, life coach, creative writer, **plus your own** (`/persona`)
 
 **It can DO things** (function calling: just ask in plain words)
 - 🌦 Weather: "weather in Paris?"
 - 📰 News: "latest news about football"
 - 💱 Prices and rates: "price of bitcoin", "convert 200 USD to NGN"
-- 📚 Wikipedia lookups · 🧮 exact calculator · 🕒 time in any city
-- ⏰ **Reminders**: "remind me tomorrow at 9am to call mum", or repeating: "every weekday at 8am take my vitamins"
+- 📚 Wikipedia lookups · 🧮 exact calculator (percentages too) · 🕒 time in any city
+- ⏰ **Reminders**: "remind me tomorrow at 9am to call mum", or repeating: "every weekday at 8am take my vitamins", or yearly ("every year on 25 Dec")
+- 🤖 **AI-written scheduled messages**: "every morning send me a motivating quote" — Gemini writes it fresh each time it's due
 - ✅ **To-do list**: "add milk to my to-do list" (tick items off with buttons)
 - 🧠 **Saved facts**: "remember that I'm vegetarian" (it uses them in later chats)
 - 🌅 **Daily briefing**: weather + news + your reminders, sent every morning
+- 📝 **Notes**: "note this: idea for the weekend" — searchable later
+- 💰 **Expense tracker**: "I spent 2k on transport" / send a receipt photo — categorised automatically, with a monthly budget bar
+- 🔁 **Habit tracker**: "track a habit called gym" / "I did my workout" — daily streaks
+- 🔔 **Price alerts**: "tell me when bitcoin goes above 70000" or "usd/ngn below 1500" — checked every 5 minutes
+- 👀 **Page watcher**: "watch this page and tell me if it changes" + a link — checked every 30 minutes
 - 🌐 Optional live web search (add a free Tavily key)
+
+**🎮 Games — `/games`** (all offline: no API key, no internet data, no Gemini quota used)
+Trivia (9 categories) · Hangman (5 categories) · Riddles · Emoji quiz · Would-you-rather ·
+Truth or dare · Guess the number · Tic-tac-toe (vs the bot) · Rock-paper-scissors ·
+Dice / coin flip / card draw · Word chain (play with friends in a group) · Jokes, quotes & random facts ·
+Magic 8-ball · a personal scoreboard across all of them.
 
 **Buttons**
 - `/menu` opens a button menu
 - Under every answer: 🔄 Regenerate · ✂️ Shorter · 🧹 New chat
+
+> **No new environment variables or database changes are needed for v2.2.** Games, notes, expenses and
+> habits work even without Upstash connected (they just won't survive a restart). Price alerts,
+> page watching and scheduled AI messages need Upstash, same as reminders already did.
 
 ## Commands
 
@@ -38,6 +54,12 @@ One codebase, deployable on **Vercel** and/or **Render**. Free.
 | `/briefing` | Daily briefing settings |
 | `/briefing time 07:30` · `city Paris` · `topics tech, football` · `on` · `off` · `now` | Configure it |
 | `/timezone Continent/City` | **Set this first**, so reminders and the briefing use your clock |
+| `/games` | 🎮 Games menu — trivia, hangman, puzzles, tic-tac-toe and more |
+| `/note <text>` · `/notes` · `/findnote <word>` | Save and search quick notes |
+| `/spent <amount> <what>` · `/expenses` | Log an expense (`5k`/`1.5k`/`2m` all work) · spending summary & budget |
+| `/habit add <name>` · `/habit del <n>` · `/habits` | Track daily habits and streaks |
+| `/alerts` | Your active price alerts (set them by just asking, e.g. "alert me when eth hits 4000") |
+| `/watching` | Pages you're watching for changes |
 | `/translate` · `/summarize` · `/fix` | One-off helpers (also work on a replied message) |
 | `/reset` | Fresh chat (saved facts are kept) |
 | `/me` | Your settings, and whether the database is connected |
@@ -51,8 +73,13 @@ phantom-ai-bot/
 │   ├── bot.js        # commands, menus, buttons (shared)
 │   ├── ai.js         # Gemini chat + function-calling loop + personas (shared)
 │   ├── tools.js      # everything Gemini can DO: weather, news, reminders... (shared)
+│   ├── games.js       # offline games: trivia, hangman, tic-tac-toe, word chain...
+│   ├── data.js        # built-in content for the games (no API, no keys)
+│   ├── features.js    # notes / expenses / habits / price alerts / page watches logic
+│   ├── extras.js       # button views for notes / expenses / habits / alerts / watches
+│   ├── kb.js           # shared keyboard + view-rendering helpers
 │   ├── store.js      # database layer (Upstash Redis, RAM fallback)
-│   ├── scheduler.js  # sends due reminders + daily briefings
+│   ├── scheduler.js  # sends due reminders, briefings, price alerts & page-watch checks
 │   ├── timeutil.js   # time-zone maths
 │   └── format.js     # markdown -> Telegram HTML, message splitting
 ├── server.js         # RENDER entry point
@@ -183,6 +210,12 @@ This tells Telegram to also send **button presses**, and refreshes the "/" comma
 6. "Remember that I like coffee" → `/facts`
 7. `/todo buy milk` → tap the number to tick it
 8. "Remind me every weekday at 8am to stretch" → `/reminders` shows 🔁
+9. `/games` → tap around (trivia, hangman, tic-tac-toe...)
+10. `/note Buy eggs` → `/notes` shows it
+11. `/spent 2500 lunch` → `/expenses` shows the total
+12. `/habit add Drink water` → `/habits`, tap to mark today done
+13. "Tell me when bitcoin goes above 100000" → `/alerts` shows it
+14. "Every morning at 8 send me a short motivational quote" → an AI-written message, not a fixed one
 
 **Later updates:** edit or upload files on GitHub → Vercel redeploys automatically in about a minute.
 Extra steps only when:

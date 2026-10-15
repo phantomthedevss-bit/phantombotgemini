@@ -5,6 +5,14 @@ import { createStore } from "./store.js";
 import { replyLong, sendLongTo } from "./format.js";
 import { buildBriefing } from "./scheduler.js";
 import { isValidTimeZone, formatLocal, parseHHMM, REPEAT_LABELS } from "./timeutil.js";
+import * as G from "./games.js";
+import {
+  viewNotes, viewNoteSearch, viewExpenses, viewHabits, viewAlerts, viewWatches,
+} from "./extras.js";
+import {
+  addNote, deleteNote, addExpense, parseAmount, fmtMoney, addHabit, removeHabit, checkHabit,
+  removeAlert, removeWatch,
+} from "./features.js";
 
 /** Shown in Telegram's "/" command menu (set automatically on startup / setup). */
 export const COMMANDS = [
@@ -18,6 +26,15 @@ export const COMMANDS = [
   { command: "reminders", description: "See / cancel reminders" },
   { command: "todo", description: "Your to-do list" },
   { command: "briefing", description: "Daily morning briefing" },
+  { command: "games", description: "🎮 Trivia, hangman, puzzles & more" },
+  { command: "note", description: "Save a quick note" },
+  { command: "notes", description: "See / search your notes" },
+  { command: "spent", description: "/spent 5000 lunch — log an expense" },
+  { command: "expenses", description: "Spending summary & budget" },
+  { command: "habit", description: "Track a daily habit" },
+  { command: "habits", description: "Your habits & streaks" },
+  { command: "alerts", description: "Your price alerts" },
+  { command: "watching", description: "Pages you're watching for changes" },
   { command: "timezone", description: "/timezone Europe/London" },
   { command: "translate", description: "/translate french Good morning" },
   { command: "summarize", description: "Summarize text or a replied message" },
@@ -48,14 +65,28 @@ I can also DO things when you ask in plain words:
 • "Add milk and bread to my to-do list"
 • "Remember that I'm vegetarian"
 • "Send me a daily briefing at 7:30 with tech news"
+• "Note this: idea for the weekend"
+• "I spent 2k on transport today" · "How much have I spent this month?"
+• "Track a habit called gym" · "I did my workout today"
+• "Tell me when bitcoin goes above 70000"
+• "Watch this page and tell me if it changes" (send a link)
+• "Every morning send me a motivating quote" (AI-written scheduled message)
+
+🎮 Games — /games for trivia, hangman, riddles, emoji quiz, would-you-rather,
+truth or dare, tic-tac-toe, rock-paper-scissors, guess the number, word chain and more.
+All offline, free, no API needed.
 
 Commands
-/menu — button menu
+/menu — button menu · /games — games menu
 /mode — switch personality · /persona — create your own
 /remember <fact> · /facts — what I know about you
 /remind <text> · /reminders — your reminders (one-off or repeating)
 /todo — your to-do list (tap to tick items off)
 /briefing — daily morning briefing
+/note <text> · /notes — quick notes
+/spent <amount> <what> · /expenses — spending tracker
+/habit add <name> · /habits — habit streaks
+/alerts — price alerts · /watching — watched pages
 /timezone <Area/City> — needed for reminders & briefing
 /translate <language> <text> · /summarize · /fix
 /reset — fresh chat · /me — your settings · /id
@@ -170,7 +201,9 @@ export function createBot(token) {
     kb: kb([
       [["🎭 Personality", "menu:mode"], ["🧠 What I know about you", "menu:facts"]],
       [["⏰ Reminders", "menu:rem"], ["✅ To-do list", "menu:todo"]],
-      [["🌅 Daily briefing", "menu:brief"]],
+      [["🌅 Daily briefing", "menu:brief"], ["🎮 Games", "menu:games"]],
+      [["📝 Notes", "menu:notes"], ["💰 Expenses", "menu:exp"]],
+      [["🔁 Habits", "menu:habits"], ["🔔 Alerts", "menu:alerts"]],
       [["🧹 New chat", "ai:reset"], ["❓ Help", "menu:help"]],
     ]),
   });
@@ -268,12 +301,54 @@ export function createBot(token) {
   }
 
   async function show(ctx, view) {
+    const opts = { reply_markup: view.kb, link_preview_options: { is_disabled: true }, parse_mode: "Markdown" };
     try {
-      await ctx.editMessageText(view.text, { reply_markup: view.kb, link_preview_options: { is_disabled: true } });
+      await ctx.editMessageText(view.text, opts);
     } catch (err) {
       if (!/not modified/i.test(err?.description ?? err?.message ?? "")) {
-        await ctx.reply(view.text, { reply_markup: view.kb, link_preview_options: { is_disabled: true } });
+        await ctx.reply(view.text, opts);
       }
+    }
+  }
+
+  /** Route a `g:<game>:<action>:<extra>` button press to the right games.js call. */
+  async function routeGame(game, action, extra, chatId, uid) {
+    switch (`${game}:${action}`) {
+      case "games:menu": return G.viewGames();
+      case "triv:menu": return G.viewTriviaMenu();
+      case "triv:cat": return G.startTrivia(store, chatId, uid, extra);
+      case "triv:a": return G.answerTrivia(store, chatId, uid, Number(extra));
+      case "hang:menu": return G.viewHangmanMenu();
+      case "hang:cat": return G.startHangman(store, chatId, uid, extra);
+      case "hang:g": return G.guessHangman(store, chatId, uid, extra);
+      case "ridl:go": return G.viewRiddle(store, chatId, uid);
+      case "ridl:reveal": return G.revealRiddle(store, chatId, uid);
+      case "emoj:go": return G.viewEmoji();
+      case "emoj:rev": return G.revealEmoji(extra);
+      case "wyr:go": return G.viewWyr();
+      case "td:menu": return G.viewTruthOrDare();
+      case "td:truth": return G.viewTruth();
+      case "td:dare": return G.viewDare();
+      case "joke:go": return G.viewJoke();
+      case "quote:go": return G.viewQuote();
+      case "fact:go": return G.viewFact();
+      case "ball:go": return G.viewEightBall();
+      case "num:start": return G.startNumberGame(store, chatId, uid);
+      case "num:g": return G.guessNumber(store, chatId, uid, Number(extra));
+      case "num:giveup": return G.giveUpNumber(store, chatId);
+      case "ttt:start": return G.startTtt(store, chatId, uid);
+      case "ttt:m": return G.moveTtt(store, chatId, uid, Number(extra));
+      case "rps:menu": return G.viewRpsMenu();
+      case "rps:p": return G.playRps(store, uid, extra);
+      case "rand:menu": return G.viewRandomMenu();
+      case "rand:coin": return G.flipCoin();
+      case "rand:dice": return G.rollDice();
+      case "rand:num": return G.randomNumber();
+      case "rand:card": return G.pickCard();
+      case "chain:start": return G.startWordChain(store, chatId);
+      case "chain:end": return G.endWordChain(store, chatId);
+      case "score:show": return G.viewScoreboard(store, uid);
+      default: return G.viewGames();
     }
   }
 
@@ -590,10 +665,114 @@ export function createBot(token) {
     );
   });
 
+  /* ----------------------------------- games ---------------------------------- */
+
+  bot.command("games", async (ctx) => {
+    const v = G.viewGames();
+    return ctx.reply(v.text, { reply_markup: v.kb, parse_mode: "Markdown" });
+  });
+
+  /* ----------------------------------- notes ----------------------------------- */
+
+  bot.command("note", async (ctx) => {
+    const text = ctx.match.trim();
+    if (!text) {
+      const v = await viewNotes(store, ctx.from.id);
+      return ctx.reply(v.text, { reply_markup: v.kb });
+    }
+    try {
+      await addNote(store, ctx.from.id, text);
+      return ctx.reply("📝 Saved. See all with /notes.");
+    } catch (err) {
+      return ctx.reply(`⚠️ ${err.message}`);
+    }
+  });
+
+  bot.command("notes", async (ctx) => {
+    const v = await viewNotes(store, ctx.from.id);
+    return ctx.reply(v.text, { reply_markup: v.kb });
+  });
+
+  bot.command("findnote", async (ctx) => {
+    const q = ctx.match.trim();
+    if (!q) return ctx.reply("Usage: /findnote <word>");
+    const v = await viewNoteSearch(store, ctx.from.id, q);
+    return ctx.reply(v.text, { reply_markup: v.kb });
+  });
+
+  /* --------------------------------- expenses --------------------------------- */
+
+  bot.command("spent", async (ctx) => {
+    const arg = ctx.match.trim();
+    if (!arg) {
+      const v = await viewExpenses(store, ctx.from.id, await store.getProfile(ctx.from.id));
+      return ctx.reply(v.text, { reply_markup: v.kb, parse_mode: "Markdown" });
+    }
+    const m = arg.match(/^(\S+)\s*(.*)$/);
+    const amount = m ? parseAmount(m[1]) : null;
+    if (!amount) return ctx.reply("Usage: /spent 5000 lunch (also accepts 5k, 1.5k, 2m)");
+    try {
+      await addExpense(store, ctx.from.id, { amount, text: m[2] });
+      return ctx.reply(`💰 Logged ${fmtMoney(amount, (await store.getProfile(ctx.from.id)).currency)}. See /expenses for a summary.`);
+    } catch (err) {
+      return ctx.reply(`⚠️ ${err.message}`);
+    }
+  });
+
+  bot.command("expenses", async (ctx) => {
+    const p = await store.getProfile(ctx.from.id);
+    const v = await viewExpenses(store, ctx.from.id, p);
+    return ctx.reply(v.text, { reply_markup: v.kb, parse_mode: "Markdown" });
+  });
+
+  /* ----------------------------------- habits ---------------------------------- */
+
+  bot.command("habit", async (ctx) => {
+    const arg = ctx.match.trim();
+    const uid = ctx.from.id;
+    const add = arg.match(/^add\s+(.+)$/i);
+    const del = arg.match(/^(?:del|delete|remove)\s+(\d+)$/i);
+    try {
+      if (add) {
+        await addHabit(store, uid, add[1]);
+        return ctx.reply(`🔁 Tracking “${add[1].trim()}”. See /habits.`);
+      }
+      if (del) {
+        const removed = await removeHabit(store, uid, Number(del[1]) - 1);
+        return ctx.reply(removed ? `🗑 Stopped tracking “${removed.n}”.` : "No habit with that number.");
+      }
+      const p = await store.getProfile(uid);
+      const v = await viewHabits(store, uid, p.tz);
+      return ctx.reply(v.text, { reply_markup: v.kb, parse_mode: "Markdown" });
+    } catch (err) {
+      return ctx.reply(`⚠️ ${err.message}`);
+    }
+  });
+
+  bot.command("habits", async (ctx) => {
+    const p = await store.getProfile(ctx.from.id);
+    const v = await viewHabits(store, ctx.from.id, p.tz);
+    return ctx.reply(v.text, { reply_markup: v.kb, parse_mode: "Markdown" });
+  });
+
+  /* ------------------------------ alerts & watches ------------------------------ */
+
+  bot.command("alerts", async (ctx) => {
+    if (!store.persistent) return ctx.reply(NEEDS_DB);
+    const v = await viewAlerts(store, ctx.from.id);
+    return ctx.reply(v.text, { reply_markup: v.kb });
+  });
+
+  bot.command("watching", async (ctx) => {
+    if (!store.persistent) return ctx.reply(NEEDS_DB);
+    const v = await viewWatches(store, ctx.from.id);
+    return ctx.reply(v.text, { reply_markup: v.kb });
+  });
+
   /* ------------------------------- button presses ---------------------------- */
 
   bot.on("callback_query:data", async (ctx) => {
-    const [ns, a, b] = ctx.callbackQuery.data.split(":");
+    const [ns, a, b, c] = ctx.callbackQuery.data.split(":");
     const uid = ctx.from.id;
     const chatId = ctx.chat?.id ?? uid;
     const clearButtons = () => ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
@@ -625,9 +804,60 @@ export function createBot(token) {
 
       /* ---- menus ---- */
       if (ns === "menu") {
-        const views = { main: viewMain, help: viewHelp, mode: () => viewMode(uid), facts: () => viewFacts(uid), rem: () => viewReminders(uid), todo: () => viewTodos(uid), brief: () => viewBriefing(uid) };
+        const p = await store.getProfile(uid);
+        const views = {
+          main: viewMain, help: viewHelp, mode: () => viewMode(uid), facts: () => viewFacts(uid),
+          rem: () => viewReminders(uid), todo: () => viewTodos(uid), brief: () => viewBriefing(uid),
+          games: G.viewGames, notes: () => viewNotes(store, uid), exp: () => viewExpenses(store, uid, p),
+          habits: () => viewHabits(store, uid, p.tz), alerts: () => viewAlerts(store, uid),
+          watching: () => viewWatches(store, uid),
+        };
         await ctx.answerCallbackQuery();
         return show(ctx, await (views[a] ?? viewMain)());
+      }
+
+      /* ---- games ---- */
+      if (ns === "g") {
+        if (a === "noop") return ctx.answerCallbackQuery();
+        await ctx.answerCallbackQuery();
+        const view = await routeGame(a, b, c, chatId, uid);
+        if (view) return show(ctx, view);
+        return;
+      }
+
+      /* ---- notes ---- */
+      if (ns === "note" && a === "del") {
+        await deleteNote(store, uid, b);
+        await ctx.answerCallbackQuery({ text: "🗑 Deleted" });
+        return show(ctx, await viewNotes(store, uid));
+      }
+
+      /* ---- habits ---- */
+      if (ns === "habit" && a === "tg") {
+        await checkHabit(store, uid, b, (await store.getProfile(uid)).tz);
+        await ctx.answerCallbackQuery({ text: "✅ Marked" });
+        return show(ctx, await viewHabits(store, uid, (await store.getProfile(uid)).tz));
+      }
+
+      /* ---- expenses period switcher ---- */
+      if (ns === "exp" && a === "p") {
+        const p2 = await store.getProfile(uid);
+        await ctx.answerCallbackQuery();
+        return show(ctx, await viewExpenses(store, uid, p2, b));
+      }
+
+      /* ---- price alerts ---- */
+      if (ns === "alert" && a === "del") {
+        await removeAlert(store, uid, b);
+        await ctx.answerCallbackQuery({ text: "❌ Cancelled" });
+        return show(ctx, await viewAlerts(store, uid));
+      }
+
+      /* ---- page watches ---- */
+      if (ns === "watch" && a === "del") {
+        await removeWatch(store, uid, b);
+        await ctx.answerCallbackQuery({ text: "❌ Stopped" });
+        return show(ctx, await viewWatches(store, uid));
       }
 
       if (ns === "mode") {
@@ -695,6 +925,17 @@ export function createBot(token) {
 
     const text = cleanText(ctx, raw);
     if (!text) return;
+
+    // An active game in this chat intercepts plain text before it reaches the AI.
+    const game = await G.loadGame(store, ctx.chat.id);
+    if (game?.kind === "number" && /^-?\d+$/.test(text.trim())) {
+      const v = await G.guessNumber(store, ctx.chat.id, ctx.from.id, Number(text.trim()));
+      if (v) return ctx.reply(v.text, { reply_markup: v.kb, parse_mode: "Markdown", ...replyOpts(ctx) });
+    }
+    if (game?.kind === "chain") {
+      const v = await G.tryWordChain(store, ctx.chat.id, ctx.from.id, text);
+      if (v) return ctx.reply(v.text, { reply_markup: v.kb, parse_mode: "Markdown", ...replyOpts(ctx) });
+    }
 
     // If the user replies to someone else's message, give Gemini that message as context.
     const quoted = repliedText(ctx);

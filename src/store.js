@@ -82,6 +82,9 @@ const defaultProfile = () => ({
   facts: [],
   personas: {},
   todos: [], // [{ t: "buy milk", done: false }]
+  currency: "", // label shown next to expense amounts, e.g. "₦" or "NGN"
+  budget: 0, // monthly spending budget (0 = none)
+  scores: {}, // game scoreboard
   briefing: { on: false, h: 7, mi: 30, city: "", topics: [] },
 });
 
@@ -120,6 +123,29 @@ export function createStore(botId) {
       const [removed] = p.facts.splice(index, 1);
       await this.saveProfile(userId, p);
       return removed;
+    },
+
+    /* --------------------- generic per-user documents (JSON) --------------------- */
+    // Used for notes, expenses, habits, alerts, page watches and game state.
+    // `ex` = optional expiry in seconds (game state expires by itself).
+    async getDoc(kind, id, fallback = null) {
+      return parse(await redis.get(k("doc", kind, id)), fallback);
+    },
+    async setDoc(kind, id, value, ex) {
+      if (ex) await redis.set(k("doc", kind, id), json(value), { ex });
+      else await redis.set(k("doc", kind, id), json(value));
+    },
+    async delDoc(kind, id) {
+      await redis.del(k("doc", kind, id));
+    },
+
+    /* ----------------- scheduled items (reminders, alerts, watches) ----------------- */
+    // member format: "<kind>|<userId>|<id>"  (r = reminder, a = price alert, w = page watch, b = briefing)
+    async scheduleItem(member, atMs) {
+      if (persistent) await redis.zadd(DUE, { score: atMs, member });
+    },
+    async unscheduleItem(member) {
+      if (persistent) await redis.zrem(DUE, member);
     },
 
     /* ------------------------------- to-do list ------------------------------ */
@@ -179,9 +205,9 @@ export function createStore(botId) {
     },
 
     /* ---------------------------- reminders ---------------------------- */
-    async addReminder({ userId, chatId, text, dueAt, repeat }) {
+    async addReminder({ userId, chatId, text, dueAt, repeat, ai }) {
       const id = Math.random().toString(36).slice(2, 8);
-      await redis.hset(k("rem", userId), { [id]: json({ id, chatId, text, dueAt, repeat: repeat || undefined }) });
+      await redis.hset(k("rem", userId), { [id]: json({ id, chatId, text, dueAt, repeat: repeat || undefined, ai: ai || undefined }) });
       await redis.zadd(DUE, { score: dueAt, member: `r|${userId}|${id}` });
       return id;
     },

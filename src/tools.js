@@ -2,7 +2,14 @@
 // Each tool = a declaration (what Gemini sees) + a run() function (what we execute).
 // All the data tools use free APIs that need no key.
 import { Type } from "@google/genai";
-import { parseLocalDateTime, formatLocal, isValidTimeZone, REPEAT_LABELS } from "./timeutil.js";
+import { createHash } from "node:crypto";
+import { parseLocalDateTime, formatLocal, isValidTimeZone, REPEAT_LABELS, REPEATS, localDateKey } from "./timeutil.js";
+import {
+  addNote, searchNotes, deleteNote,
+  addExpense, summarizeExpenses, fmtMoney, CATEGORY_LABELS,
+  addHabit, listHabits, checkHabit, streakOf,
+  addAlert, listAlerts, removeAlert, addWatch, listWatches, removeWatch,
+} from "./features.js";
 
 const UA = "PhantomAIBot/2.0 (Telegram assistant)";
 const TIMEOUT = 10_000;
@@ -122,7 +129,7 @@ function htmlToText(html) {
   ).trim();
 }
 
-async function readUrl(rawUrl) {
+export async function readUrl(rawUrl) {
   let url;
   try {
     url = new URL(rawUrl);
@@ -155,13 +162,14 @@ async function readUrl(rawUrl) {
 
 /* --------------------------------- calculator ------------------------------- */
 
-function calculate(expression) {
+export function calculate(expression) {
   const e = String(expression)
     .replace(/\s+/g, "")
     .replace(/[×x]/g, "*")
     .replace(/÷/g, "/")
     .replace(/\^/g, "**")
-    .replace(/,/g, "");
+    .replace(/,/g, "")
+    .replace(/(\d+(?:\.\d+)?)%of(\d+(?:\.\d+)?)/gi, "($1/100*$2)"); // "15% of 2000"
   if (!/^[0-9+\-*/%().]+$/.test(e)) throw new Error("Only numbers and + - * / % ^ ( ) are allowed.");
   const value = Function(`"use strict"; return (${e});`)();
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("That doesn't give a finite number.");
@@ -177,6 +185,36 @@ const COIN_ALIASES = {
   avax: "avalanche-2", link: "chainlink",
 };
 
+const COIN_IDS = new Set(Object.values(COIN_ALIASES));
+export const isCoin = (s) => {
+  const x = String(s).toLowerCase();
+  return x in COIN_ALIASES || COIN_IDS.has(x);
+};
+
+/**
+ * Current price of an asset. "btc" / "bitcoin" / "eth/ngn" = crypto (in USD unless a currency is given),
+ * "usd/ngn" = a currency pair. Returns { price, label, unit }.
+ */
+export async function getAssetPrice(asset) {
+  const [left, right] = String(asset).trim().split("/").map((x) => x.trim());
+  if (!left) throw new Error("Which asset?");
+
+  if (right && !isCoin(left) && /^[a-z]{3}$/i.test(left) && /^[a-z]{3}$/i.test(right)) {
+    const f = left.toUpperCase();
+    const t = right.toUpperCase();
+    const data = await getJson(`https://open.er-api.com/v6/latest/${encodeURIComponent(f)}`);
+    const rate = data.rates?.[t];
+    if (data.result !== "success" || !rate) throw new Error(`I don't have a rate for ${f}/${t}.`);
+    return { price: rate, label: `${f}/${t}`, unit: "" };
+  }
+
+  const id = COIN_ALIASES[left.toLowerCase()] ?? left.toLowerCase().replace(/\s+/g, "-");
+  const cur = (right || "usd").toLowerCase();
+  const data = await getJson(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=${cur}`);
+  if (data[id]?.[cur] === undefined) throw new Error(`I couldn't find a price for "${asset}" (try the full coin name).`);
+  return { price: data[id][cur], label: left.toUpperCase().length <= 5 ? left.toUpperCase() : id, unit: cur.toUpperCase() };
+}
+
 /* ---------------------------------- helpers --------------------------------- */
 
 const needDb = (env) =>
@@ -186,6 +224,37 @@ const needDb = (env) =>
 
 const str = (description) => ({ type: Type.STRING, description });
 const obj = (properties, required = []) => ({ type: Type.OBJECT, properties, required });
+
+/** Shared by set_reminder and schedule_ai_message. */
+async function makeReminder({ text, in_minutes, datetime_local, repeat }, env, extra = {}) {
+  const blocked = needDb(env);
+  if (blocked) return { error: blocked };
+  const tz = env.profile.tz;
+  let dueAt;
+  if (typeof in_minutes === "number" && in_minutes > 0) dueAt = Date.now() + Math.round(in_minutes * 60_000);
+  else dueAt = parseLocalDateTime(datetime_local, tz);
+  if (!dueAt) return { error: "I need either in_minutes or datetime_local (YYYY-MM-DDTHH:MM)." };
+  if (dueAt < Date.now() - 30_000) return { error: "That time is already in the past. Ask the user for a future time." };
+  if (dueAt > Date.now() + 366 * 86_400_000) return { error: "The first send can be at most one year ahead." };
+
+  const rep = REPEATS.includes(repeat) ? repeat : undefined;
+  const id = await env.store.addReminder({
+    userId: env.userId,
+    chatId: env.chatId,
+    text: String(text).slice(0, 500),
+    dueAt,
+    repeat: rep,
+    ...extra,
+  });
+  return {
+    ok: true,
+    id,
+    repeats: rep ? REPEAT_LABELS[rep] : "no (one time)",
+    will_fire_at: formatLocal(dueAt, tz),
+    timezone: tz,
+    note: env.profile.tzSet ? undefined : "The user hasn't set a time zone yet, so UTC was assumed. Tell them to send /timezone Continent/City.",
+  };
+}
 
 /* ----------------------------------- tools ---------------------------------- */
 
@@ -389,37 +458,37 @@ const TOOLS = {
           datetime_local: str("Local date-time in the USER's time zone, format YYYY-MM-DDTHH:MM (24h)"),
           repeat: {
             type: Type.STRING,
-            enum: ["daily", "weekly", "weekdays"],
+            enum: REPEATS,
             description:
-              "Only for repeating reminders. 'daily' = every day, 'weekdays' = Monday to Friday, 'weekly' = same weekday every week. " +
-              "datetime_local must then be the FIRST occurrence (e.g. for 'every Monday 8am', the next Monday 08:00).",
+              "Only for repeating reminders. 'daily' = every day, 'weekdays' = Monday to Friday, 'weekly' = same weekday every week, " +
+              "'yearly' = every year (birthdays, anniversaries). datetime_local must then be the FIRST occurrence " +
+              "(e.g. for 'every Monday 8am', the next Monday 08:00; for a birthday on 25 Dec, the next 25 Dec at 08:00).",
           },
         },
         ["text"],
       ),
     },
-    run: async ({ text, in_minutes, datetime_local, repeat }, env) => {
-      const blocked = needDb(env);
-      if (blocked) return { error: blocked };
-      const tz = env.profile.tz;
-      let dueAt;
-      if (typeof in_minutes === "number" && in_minutes > 0) dueAt = Date.now() + Math.round(in_minutes * 60_000);
-      else dueAt = parseLocalDateTime(datetime_local, tz);
-      if (!dueAt) return { error: "I need either in_minutes or datetime_local (YYYY-MM-DDTHH:MM)." };
-      if (dueAt < Date.now() - 30_000) return { error: "That time is already in the past. Ask the user for a future time." };
-      if (dueAt > Date.now() + 366 * 86_400_000) return { error: "Reminders can be at most one year ahead." };
+    run: (args, env) => makeReminder(args, env),
+  },
 
-      const rep = ["daily", "weekly", "weekdays"].includes(repeat) ? repeat : undefined;
-      const id = await env.store.addReminder({ userId: env.userId, chatId: env.chatId, text: String(text).slice(0, 500), dueAt, repeat: rep });
-      return {
-        ok: true,
-        id,
-        repeats: rep ? REPEAT_LABELS[rep] : "no (one time)",
-        will_fire_at: formatLocal(dueAt, tz),
-        timezone: tz,
-        note: env.profile.tzSet ? undefined : "The user hasn't set a time zone yet, so UTC was assumed. Tell them to send /timezone Continent/City.",
-      };
+  schedule_ai_message: {
+    declaration: {
+      name: "schedule_ai_message",
+      description:
+        "Schedule a message that the AI WRITES fresh each time it is sent (e.g. 'every morning at 6 send me a motivational quote', " +
+        "'every Friday summarise tech news', 'daily at 8pm tell me the bitcoin price'). The prompt is what the AI will be asked at send time. " +
+        "Use set_reminder instead for fixed text.",
+      parameters: obj(
+        {
+          prompt: str("Instruction for the AI at send time, e.g. 'Give me a short motivational quote and a one-line fitness tip'"),
+          in_minutes: { type: Type.NUMBER, description: "Minutes from now (first send)" },
+          datetime_local: str("First send, local date-time in the USER's time zone, YYYY-MM-DDTHH:MM (24h)"),
+          repeat: { type: Type.STRING, enum: REPEATS, description: "Omit for a one-time message" },
+        },
+        ["prompt"],
+      ),
     },
+    run: ({ prompt, ...rest }, env) => makeReminder({ text: prompt, ...rest }, env, { ai: true }),
   },
 
   list_reminders: {
@@ -512,6 +581,214 @@ const TOOLS = {
     },
   },
 
+  /* ----------------------------------- notes ----------------------------------- */
+
+  save_note: {
+    declaration: {
+      name: "save_note",
+      description: "Save a note, idea, link or snippet for the user to find later. Use when they say 'note this', 'save this', 'jot down'.",
+      parameters: obj({ text: str("The note, kept close to the user's own words") }, ["text"]),
+    },
+    run: async ({ text }, env) => {
+      const n = await addNote(env.store, env.userId, text);
+      return { saved: true, id: n.id };
+    },
+  },
+
+  search_notes: {
+    declaration: {
+      name: "search_notes",
+      description: "Find the user's saved notes. Leave the query empty to get the newest ones.",
+      parameters: obj({ query: str("Words to look for") }),
+    },
+    run: async ({ query }, env) => {
+      const notes = await searchNotes(env.store, env.userId, query);
+      return { count: notes.length, notes: notes.map((n) => ({ id: n.id, text: n.t, saved: formatLocal(n.at, env.profile.tz) })) };
+    },
+  },
+
+  delete_note: {
+    declaration: {
+      name: "delete_note",
+      description: "Delete a saved note by id, or the first note containing the given text.",
+      parameters: obj({ ref: str("Note id, or text the note contains") }, ["ref"]),
+    },
+    run: async ({ ref }, env) => {
+      const n = await deleteNote(env.store, env.userId, ref);
+      return n ? { deleted: n.t } : { error: "No matching note." };
+    },
+  },
+
+  /* --------------------------------- expenses --------------------------------- */
+
+  log_expense: {
+    declaration: {
+      name: "log_expense",
+      description:
+        "Record money the user spent. Also use it when the user sends a photo of a RECEIPT: read the total (and what it was for) and log it.",
+      parameters: obj(
+        {
+          amount: { type: Type.NUMBER, description: "Amount spent, as a plain number (5k = 5000)" },
+          description: str("What it was for, e.g. 'lunch at Mama Put'"),
+          category: { type: Type.STRING, enum: Object.keys(CATEGORY_LABELS), description: "Best matching category" },
+        },
+        ["amount", "description"],
+      ),
+    },
+    run: async ({ amount, description, category }, env) => {
+      const e = await addExpense(env.store, env.userId, { amount, text: description, category });
+      const sum = await summarizeExpenses(env.store, env.userId, "today", env.profile.tz);
+      return { logged: true, id: e.id, category: e.c, spent_today: fmtMoney(sum.total, env.profile.currency) };
+    },
+  },
+
+  expense_summary: {
+    declaration: {
+      name: "expense_summary",
+      description: "Summarise the user's spending for a period, with a breakdown by category.",
+      parameters: obj({ period: { type: Type.STRING, enum: ["today", "week", "month", "all"], description: "Default month" } }),
+    },
+    run: async ({ period = "month" }, env) => {
+      const sum = await summarizeExpenses(env.store, env.userId, period, env.profile.tz);
+      const cur = env.profile.currency;
+      return {
+        period,
+        total: fmtMoney(sum.total, cur),
+        transactions: sum.count,
+        by_category: sum.byCategory.map(([c, t]) => ({ category: CATEGORY_LABELS[c] ?? c, total: fmtMoney(t, cur) })),
+        monthly_budget: period === "month" && env.profile.budget ? fmtMoney(env.profile.budget, cur) : undefined,
+        recent: sum.recent.slice(0, 5).map((x) => ({ what: x.t, amount: fmtMoney(x.a, cur) })),
+      };
+    },
+  },
+
+  configure_money: {
+    declaration: {
+      name: "configure_money",
+      description: "Set the currency label shown with expenses (e.g. '₦', 'NGN', '$') and/or the user's monthly spending budget.",
+      parameters: obj({
+        currency: str("Currency symbol or code"),
+        monthly_budget: { type: Type.NUMBER, description: "Monthly budget amount; 0 removes it" },
+      }),
+    },
+    run: async ({ currency, monthly_budget }, env) => {
+      const p = await env.store.getProfile(env.userId);
+      if (typeof currency === "string") p.currency = currency.trim().slice(0, 5);
+      if (typeof monthly_budget === "number" && monthly_budget >= 0) p.budget = monthly_budget;
+      await env.store.saveProfile(env.userId, p);
+      return { currency: p.currency, monthly_budget: p.budget };
+    },
+  },
+
+  /* ----------------------------------- habits ---------------------------------- */
+
+  add_habit: {
+    declaration: {
+      name: "add_habit",
+      description: "Start tracking a daily habit for the user (e.g. 'Drink water', 'Read 10 pages', 'Gym').",
+      parameters: obj({ name: str("Habit name") }, ["name"]),
+    },
+    run: async ({ name }, env) => ({ added: (await addHabit(env.store, env.userId, name)).n }),
+  },
+
+  check_habit: {
+    declaration: {
+      name: "check_habit",
+      description: "Mark a habit as done today (by name or number). Use when the user says they did it.",
+      parameters: obj({ habit: str("Habit name (or part of it) or its number") }, ["habit"]),
+    },
+    run: async ({ habit }, env) => {
+      const r = await checkHabit(env.store, env.userId, habit, env.profile.tz);
+      if (!r) return { error: "I couldn't find that habit. Use list_habits." };
+      return { habit: r.habit.n, already_done_today: r.already, streak_days: r.streak };
+    },
+  },
+
+  list_habits: {
+    declaration: { name: "list_habits", description: "List the user's habits with today's status and streaks.", parameters: obj({}) },
+    run: async (_a, env) => {
+      const today = localDateKey(Date.now(), env.profile.tz);
+      const list = await listHabits(env.store, env.userId);
+      return { habits: list.map((h, i) => ({ number: i + 1, name: h.n, done_today: h.days.includes(today), streak_days: streakOf(h.days, today) })) };
+    },
+  },
+
+  /* ------------------------------- price alerts ------------------------------- */
+
+  set_price_alert: {
+    declaration: {
+      name: "set_price_alert",
+      description:
+        "Notify the user when a crypto price or exchange rate crosses a level. Checked every 5 minutes. " +
+        "asset: a coin ('bitcoin', 'btc', 'eth', optionally 'btc/ngn' for another currency) or a currency pair ('usd/ngn').",
+      parameters: obj(
+        {
+          asset: str("e.g. 'btc', 'ethereum', 'usd/ngn'"),
+          direction: { type: Type.STRING, enum: ["above", "below"], description: "Alert when the price goes above or below the target" },
+          target: { type: Type.NUMBER, description: "Target price / rate" },
+        },
+        ["asset", "direction", "target"],
+      ),
+    },
+    run: async ({ asset, direction, target }, env) => {
+      const blocked = needDb(env);
+      if (blocked) return { error: blocked };
+      if (!(target > 0) || !["above", "below"].includes(direction)) return { error: "I need a direction (above/below) and a positive target." };
+      const now = await getAssetPrice(asset); // also proves the asset exists
+      const already = direction === "above" ? now.price >= target : now.price <= target;
+      if (already) return { error: `It's already ${direction} that level (now ${now.price} ${now.unit}). Ask for a different target.` };
+      const a = await addAlert(env.store, env.userId, { asset, dir: direction, target, chatId: env.chatId });
+      return { ok: true, id: a.id, asset: now.label, current_price: `${now.price} ${now.unit}`.trim(), will_alert_when: `${direction} ${target}` };
+    },
+  },
+
+  list_price_alerts: {
+    declaration: { name: "list_price_alerts", description: "List the user's active price alerts.", parameters: obj({}) },
+    run: async (_a, env) => ({ alerts: (await listAlerts(env.store, env.userId)).map((a) => ({ id: a.id, asset: a.asset, when: `${a.dir} ${a.target}` })) }),
+  },
+
+  cancel_price_alert: {
+    declaration: {
+      name: "cancel_price_alert",
+      description: "Cancel a price alert by id (see list_price_alerts).",
+      parameters: obj({ id: str("Alert id") }, ["id"]),
+    },
+    run: async ({ id }, env) => ({ cancelled: !!(await removeAlert(env.store, env.userId, String(id))) }),
+  },
+
+  /* ------------------------------- page watching ------------------------------- */
+
+  watch_page: {
+    declaration: {
+      name: "watch_page",
+      description:
+        "Watch a web page and notify the user when its content changes (checked every 30 minutes). Works best on simple, mostly static pages.",
+      parameters: obj({ url: str("Full http(s) URL") }, ["url"]),
+    },
+    run: async ({ url }, env) => {
+      const blocked = needDb(env);
+      if (blocked) return { error: blocked };
+      const page = await readUrl(url); // also validates the address
+      const hash = createHash("sha1").update(page.text).digest("hex");
+      const w = await addWatch(env.store, env.userId, { url: page.url, chatId: env.chatId, hash, text: page.text });
+      return { ok: true, id: w.id, watching: page.url, checks: "every 30 minutes" };
+    },
+  },
+
+  list_watched_pages: {
+    declaration: { name: "list_watched_pages", description: "List the pages the user is watching.", parameters: obj({}) },
+    run: async (_a, env) => ({ pages: (await listWatches(env.store, env.userId)).map((w) => ({ id: w.id, url: w.url })) }),
+  },
+
+  stop_watching: {
+    declaration: {
+      name: "stop_watching",
+      description: "Stop watching a page by id (see list_watched_pages).",
+      parameters: obj({ id: str("Watch id") }, ["id"]),
+    },
+    run: async ({ id }, env) => ({ stopped: !!(await removeWatch(env.store, env.userId, String(id))) }),
+  },
+
   /* ------------------------------ daily briefing ------------------------------ */
 
   configure_briefing: {
@@ -555,16 +832,23 @@ const TOOLS = {
 };
 
 /** What Gemini is told it can call. */
-export function toolDeclarations() {
-  return Object.values(TOOLS)
-    .filter((t) => !t.optional || t.optional())
-    .map((t) => t.declaration);
+// Scheduled AI messages run unattended, so they may only READ data (never change settings or schedule more things).
+const READ_ONLY = new Set([
+  "get_weather", "get_news", "get_crypto_price", "convert_currency", "wikipedia", "calculator", "get_time", "read_webpage", "web_search",
+  "search_notes", "expense_summary", "list_habits", "list_todos", "list_reminders",
+]);
+
+export function toolDeclarations(env) {
+  return Object.entries(TOOLS)
+    .filter(([name, t]) => (!t.optional || t.optional()) && (!env?.readOnly || READ_ONLY.has(name)))
+    .map(([, t]) => t.declaration);
 }
 
 /** Run a tool call from Gemini. Never throws: errors go back to Gemini so it can explain them. */
 export async function runTool(name, args, env) {
   const tool = TOOLS[name];
   if (!tool) return { error: `Unknown tool: ${name}` };
+  if (env?.readOnly && !READ_ONLY.has(name)) return { error: "That isn't allowed in a scheduled message." };
   try {
     return (await tool.run(args ?? {}, env)) ?? { ok: true };
   } catch (err) {

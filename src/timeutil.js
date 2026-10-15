@@ -57,6 +57,14 @@ export function nextOccurrence(hh, mm, tz, now = Date.now()) {
  */
 export function nextRepeat(dueAt, repeat, tz, now = Date.now()) {
   const p = localParts(dueAt, tz);
+  if (repeat === "yearly") {
+    for (let k = 1; k < 60; k++) {
+      const d = new Date(Date.UTC(p.y + k, p.m - 1, p.d)); // 29 Feb rolls to 1 Mar in non-leap years
+      const ts = zonedToUtc(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate(), p.h, p.mi, tz);
+      if (ts > now) return ts;
+    }
+    return null;
+  }
   const step = repeat === "weekly" ? 7 : 1;
   let day = 0;
   for (let i = 0; i < 800; i++) {
@@ -69,7 +77,43 @@ export function nextRepeat(dueAt, repeat, tz, now = Date.now()) {
   return null;
 }
 
-export const REPEAT_LABELS = { daily: "every day", weekly: "every week", weekdays: "every weekday" };
+export const REPEAT_LABELS = { daily: "every day", weekly: "every week", weekdays: "every weekday", yearly: "every year" };
+export const REPEATS = Object.keys(REPEAT_LABELS);
+
+/** "2026-10-14" for the wall clock in tz. */
+export function localDateKey(ts, tz) {
+  const p = localParts(ts, tz);
+  return `${p.y}-${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}`;
+}
+
+/** UTC ms where "today" | "week" (Mon-start) | "month" | "all" begins in tz. */
+export function periodStart(period, tz, now = Date.now()) {
+  const p = localParts(now, tz);
+  if (period === "today") return zonedToUtc(p.y, p.m, p.d, 0, 0, tz);
+  if (period === "month") return zonedToUtc(p.y, p.m, 1, 0, 0, tz);
+  if (period === "week") {
+    const dow = new Date(Date.UTC(p.y, p.m - 1, p.d)).getUTCDay(); // 0 = Sunday
+    const d = new Date(Date.UTC(p.y, p.m - 1, p.d - ((dow + 6) % 7)));
+    return zonedToUtc(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate(), 0, 0, tz);
+  }
+  return 0;
+}
+
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const DAYS_IN = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/** "25 Dec", "Dec 25", "25/12", "25-12" (day first) -> { d, m } or null */
+export function parseDayMonth(str) {
+  const s = String(str ?? "").trim().toLowerCase();
+  let d, m;
+  let r = s.match(/^(\d{1,2})[\s\/.-]+(\d{1,2})$/);
+  if (r) [d, m] = [Number(r[1]), Number(r[2])];
+  else if ((r = s.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})$/))) [d, m] = [Number(r[1]), MONTHS.indexOf(r[2].slice(0, 3)) + 1];
+  else if ((r = s.match(/^([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?$/))) [d, m] = [Number(r[2]), MONTHS.indexOf(r[1].slice(0, 3)) + 1];
+  else return null;
+  if (!(m >= 1 && m <= 12) || !(d >= 1 && d <= DAYS_IN[m - 1])) return null;
+  return { d, m };
+}
 
 /** Parse "2026-10-12T09:30" (wall-clock in tz) -> UTC ms, or null. */
 export function parseLocalDateTime(str, tz) {

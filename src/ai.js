@@ -45,6 +45,29 @@ End with one short question that checks the user's understanding.`,
     prompt: `${BASE_PROMPT}
 Answer in the fewest words possible: 1-3 short sentences unless the user explicitly asks for more.`,
   },
+  naija: {
+    label: "Naija buddy 🇳🇬",
+    prompt: `${BASE_PROMPT}
+You are a warm, funny Nigerian friend. Mix in light Nigerian Pidgin and Naija slang naturally (not every sentence), keep answers accurate and useful.`,
+  },
+  coach: {
+    label: "Life coach",
+    prompt: `${BASE_PROMPT}
+You are an encouraging, practical life and productivity coach. Ask one good question, then give 2-3 concrete next steps. No lectures.`,
+  },
+  writer: {
+    label: "Creative writer",
+    prompt: `${BASE_PROMPT}
+You are a vivid creative writer. Favour imagery, rhythm and surprise. Offer a short draft first, then ask if the user wants a different tone.`,
+  },
+  // Hidden: used by the AI game modes (not shown in /mode).
+  gamemaster: {
+    label: "Game master",
+    hidden: true,
+    prompt: `${BASE_PROMPT}
+You are a playful game master running a text game inside Telegram. Stay in character, keep each message under 120 words,
+always end with what the player can do next, and keep the game fair and fun.`,
+  },
 };
 
 /** The active persona for a profile: a built-in mode or one the user created. */
@@ -82,6 +105,9 @@ function buildSystem(profile, withTools) {
       "- For repeating reminders ('every day at 8', 'every Monday') also set repeat, with datetime_local = the first occurrence.",
       "- Tasks without a specific time go on the to-do list: add_todo, list_todos, complete_todo, delete_todo.",
       "- If the user says where they live and their time zone isn't set, call set_timezone.",
+      "- Notes: save_note / search_notes / delete_note. Spending: log_expense (a photo of a receipt: read the total and log it), expense_summary, configure_money. Habits: add_habit, check_habit, list_habits.",
+      "- To be notified when a crypto price or exchange rate crosses a level use set_price_alert; to be told when a web page changes use watch_page.",
+      "- To have an AI-written message sent later or on a schedule (e.g. 'every morning send me a motivational quote', 'remind me Friday with a summary of Bitcoin news') use schedule_ai_message with a self-contained prompt.",
       "- Never claim you set a reminder, saved a fact or changed a setting unless the tool result confirms it. If a tool returns an error, explain it simply.",
       "- When you used a tool, answer in natural language; don't dump raw JSON.",
     );
@@ -111,8 +137,8 @@ async function callModel(models, contents, config) {
 }
 
 /** Generate text, letting Gemini call tools in a loop until it has a final answer. */
-async function generate({ contents, system, env }) {
-  const decls = env ? toolDeclarations() : [];
+async function generate({ contents, system, env, json = false }) {
+  const decls = env ? toolDeclarations(env) : [];
   const models = modelList();
   const convo = [...contents];
 
@@ -120,6 +146,7 @@ async function generate({ contents, system, env }) {
     const lastStep = step === MAX_TOOL_STEPS; // force a text answer on the final round
     const config = { systemInstruction: system };
     if (decls.length && !lastStep) config.tools = [{ functionDeclarations: decls }];
+    if (json && !config.tools) config.responseMimeType = "application/json"; // JSON mode can't be combined with tools
 
     const res = await callModel(models, convo, config);
     const calls = res.functionCalls;
@@ -187,6 +214,36 @@ export async function oneShot(instruction, userText) {
     contents: [{ role: "user", parts: [{ text: userText }] }],
     system: `${instruction}\n\nCurrent date/time (UTC): ${new Date().toUTCString()}`,
     env: null,
+  });
+}
+
+/** Ask for a JSON answer (used by the AI games). Returns the parsed value, or null if it wasn't valid JSON. */
+export async function askJson(instruction, userText) {
+  const text = await generate({
+    contents: [{ role: "user", parts: [{ text: userText }] }],
+    system: `${instruction}\n\nReply with JSON only.`,
+    env: null,
+    json: true,
+  });
+  try {
+    return JSON.parse(text.replace(/^```(?:json)?|```$/gim, "").trim());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run a saved prompt unattended (scheduled AI messages). Read-only tools only, no memory of the chat.
+ */
+export async function runScheduledPrompt({ store, userId, chatId, prompt }) {
+  const profile = await store.getProfile(userId);
+  const env = { store, userId, chatId, profile, readOnly: true };
+  return generate({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    system:
+      `${buildSystem(profile, false)}\n\nYou are sending a scheduled message the user asked for earlier. ` +
+      "Write the message itself, directly to the user (no 'Sure!' preamble). Use tools for live data if needed.",
+    env,
   });
 }
 

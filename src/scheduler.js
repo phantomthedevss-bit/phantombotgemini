@@ -1,6 +1,8 @@
 // src/scheduler.js — sends due reminders and daily briefings. Called once a minute (see README).
-import { oneShot } from "./ai.js";
-import { fetchWeather, fetchNews } from "./tools.js";
+import { createHash } from "node:crypto";
+import { oneShot, runScheduledPrompt } from "./ai.js";
+import { fetchWeather, fetchNews, getAssetPrice, readUrl } from "./tools.js";
+import { listAlerts, removeAlert, listWatches, removeWatch, alertHit, ALERT_INTERVAL, WATCH_INTERVAL, ALERT_LIFETIME } from "./features.js";
 import { nextOccurrence, nextRepeat, formatLocal, REPEAT_LABELS } from "./timeutil.js";
 import { sendLongTo } from "./format.js";
 
@@ -88,8 +90,80 @@ async function sendReminder(api, store, userId, id) {
       repeating = true;
     }
   }
-  await api.sendMessage(r.chatId, `⏰ Reminder${repeating ? ` 🔁 (${REPEAT_LABELS[r.repeat]})` : ""}\n\n${r.text}`);
+  const tag = repeating ? ` 🔁 (${REPEAT_LABELS[r.repeat]})` : "";
+  if (r.ai) {
+    // A scheduled AI message: Gemini writes it right now (read-only tools).
+    let text;
+    try {
+      text = await runScheduledPrompt({ store, userId, chatId: r.chatId, prompt: r.text });
+    } catch (err) {
+      console.error("[scheduler] AI message failed:", err?.message ?? err);
+      text = `(I couldn't write this one: ${r.text})`;
+    }
+    await sendLongTo(api, r.chatId, `🤖 Scheduled${tag}\n\n${text}`);
+  } else {
+    await api.sendMessage(r.chatId, `⏰ Reminder${tag}\n\n${r.text}`);
+  }
   if (!repeating) await store.deleteReminderData(userId, id);
+}
+
+/* ----------------------------- price alerts ------------------------------- */
+
+async function checkAlert(api, store, userId, id) {
+  const alert = (await listAlerts(store, userId)).find((a) => a.id === id);
+  if (!alert) return; // cancelled
+  if (Date.now() - alert.at > ALERT_LIFETIME) {
+    await removeAlert(store, userId, id);
+    await api.sendMessage(alert.chatId, `⌛ Your price alert for ${alert.asset} (${alert.dir} ${alert.target}) expired after 90 days.`);
+    return;
+  }
+  await store.scheduleItem(`a|${userId}|${id}`, Date.now() + ALERT_INTERVAL); // next check first
+  const now = await getAssetPrice(alert.asset);
+  if (!alertHit(alert, now.price)) return;
+  await removeAlert(store, userId, id);
+  await api.sendMessage(
+    alert.chatId,
+    `🔔 Price alert: ${now.label} is now ${now.price} ${now.unit}`.trim() + `\n(You asked to be told when it went ${alert.dir} ${alert.target}.)`,
+  );
+}
+
+/* ------------------------------ page watches ------------------------------ */
+
+async function checkWatch(api, store, userId, id) {
+  const w = (await listWatches(store, userId)).find((x) => x.id === id);
+  if (!w) return;
+  await store.scheduleItem(`w|${userId}|${id}`, Date.now() + WATCH_INTERVAL);
+  let page;
+  try {
+    page = await readUrl(w.url);
+  } catch (err) {
+    // Give up quietly after several failures in a row (site down / removed).
+    const list = await listWatches(store, userId);
+    const cur = list.find((x) => x.id === id);
+    if (cur && ++cur.fails >= 6) {
+      await removeWatch(store, userId, id);
+      await api.sendMessage(w.chatId, `👀 I stopped watching ${w.url} because I couldn't open it several times in a row.`);
+    } else if (cur) await store.setDoc("watches", userId, list);
+    return;
+  }
+  const hash = createHash("sha1").update(page.text).digest("hex");
+  const list = await listWatches(store, userId);
+  const cur = list.find((x) => x.id === id);
+  if (!cur) return;
+  cur.fails = 0;
+  if (hash === cur.hash) return void (await store.setDoc("watches", userId, list));
+
+  // Changed: show what's new (lines that weren't there before), best effort.
+  const before = new Set(cur.text.split("\n").map((l) => l.trim()));
+  const fresh = page.text.split("\n").map((l) => l.trim()).filter((l) => l.length > 3 && !before.has(l)).slice(0, 8);
+  cur.hash = hash;
+  cur.text = page.text.slice(0, 6000);
+  await store.setDoc("watches", userId, list);
+  await api.sendMessage(
+    w.chatId,
+    `👀 This page changed:\n${w.url}` + (fresh.length ? `\n\nNew:\n${fresh.map((l) => `• ${l.slice(0, 160)}`).join("\n")}` : ""),
+    { link_preview_options: { is_disabled: true } },
+  );
 }
 
 /* ------------------------------- the ticker ------------------------------- */
@@ -103,6 +177,8 @@ export async function runDue(api, store) {
     try {
       if (kind === "r") await sendReminder(api, store, userId, id);
       else if (kind === "b") await sendBriefing(api, store, userId);
+      else if (kind === "a") await checkAlert(api, store, userId, id);
+      else if (kind === "w") await checkWatch(api, store, userId, id);
     } catch (err) {
       console.error(`[scheduler] ${item} failed:`, err?.description ?? err?.message ?? err);
     }
